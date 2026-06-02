@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: omnimind-backend
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    volumes:
+      - omnimind_data:/data          # persists ChromaDB + uploads across restarts
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - OLLAMA_LLM_MODEL=qwen2.5:7b
+      - OLLAMA_VISION_MODEL=llava:7b
+      - EMBED_MODEL=BAAI/bge-large-en-v1.5
+      - CHROMA_DB_PATH=/data/chroma_db
+      - UPLOAD_DIR=/data/uploads
+      - WHISPER_MODEL=base
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Linux support
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: omnimind-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  omnimind_data:

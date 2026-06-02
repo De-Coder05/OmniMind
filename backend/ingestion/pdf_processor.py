@@ -41,8 +41,8 @@ def process_pdf(file_path: str) -> List[Dict[str, Any]]:
         # --- Text chunks ---
         text = page.get_text("text").strip()
         if text:
-            # Split into ~500-char chunks with overlap
-            for chunk in _split_text(text, chunk_size=500, overlap=50):
+            # Split into ~200-word chunks with overlap
+            for chunk in _split_text(text, chunk_size=200, overlap=30):
                 chunks.append({
                     "text": chunk,
                     "modality": "text",
@@ -71,7 +71,7 @@ def process_pdf(file_path: str) -> List[Dict[str, Any]]:
     return chunks
 
 
-def _split_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+def _split_text(text: str, chunk_size: int = 200, overlap: int = 30) -> List[str]:
     words = text.split()
     chunks = []
     i = 0

@@ -1,6 +1,6 @@
 import os
 import httpx
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from backend.embeddings.store import query_collection
 
@@ -8,7 +8,7 @@ load_dotenv()
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 LLM_MODEL = os.getenv("OLLAMA_LLM_MODEL", "llama3")
-MAX_HOPS = 3  # max tool-call iterations
+MAX_HISTORY_TURNS = 4  # keep last 4 user/assistant pairs in context
 
 
 def _call_ollama(messages: List[Dict]) -> str:
@@ -20,107 +20,204 @@ def _call_ollama(messages: List[Dict]) -> str:
     return resp.json()["message"]["content"]
 
 
-def _build_system_prompt() -> str:
-    return """You are OmniMind, an expert research assistant with access to a multimodal document store containing text, images, audio transcripts, and tables.
-
-You answer questions by reasoning step-by-step and searching the document store for relevant information.
-
-TOOL AVAILABLE:
-- search(query: str) → returns relevant excerpts from the document store
-
-RULES:
-1. Always search before answering. Do not rely on prior knowledge alone.
-2. If one search is not enough, search again with a refined query (up to 3 searches).
-3. After gathering evidence, synthesize a final answer with inline citations like [Source: filename, page X].
-4. If information is not found in the documents, say so clearly.
-5. For image or audio content, treat the description/transcript as the source.
-
-FORMAT your response as:
-THOUGHT: <your reasoning>
-SEARCH: <query> (repeat THOUGHT/SEARCH up to 3 times if needed)
-ANSWER: <final synthesized answer with citations>"""
+def _infer_doc_role(filename: str) -> str:
+    """Heuristic: label a file as JD, Resume, or Document based on its name."""
+    name = filename.lower()
+    if any(k in name for k in ["jd", "job", "description", "position", "role", "hiring", "opening"]):
+        return "JOB DESCRIPTION"
+    if any(k in name for k in ["resume", "cv", "curriculum", "profile", "candidate"]):
+        return "CANDIDATE RESUME"
+    return "DOCUMENT"
 
 
-def _parse_search_query(text: str) -> str | None:
-    """Extract the query from a SEARCH: line."""
-    for line in text.split("\n"):
-        if line.strip().upper().startswith("SEARCH:"):
-            return line.split(":", 1)[1].strip()
-    return None
+def _build_context(chunks: List[Dict[str, Any]]) -> str:
+    parts = []
+    for i, c in enumerate(chunks):
+        src = c["metadata"].get("source", "unknown")
+        page = c["metadata"].get("page", "?")
+        modality = c["metadata"].get("modality", "text")
+        role = _infer_doc_role(src)
+        label = f"[{i+1}] {role}: {src}, p.{page} ({modality})"
+        parts.append(f"{label}\n{c['text']}")
+    return "\n\n---\n\n".join(parts)
 
 
-def _parse_final_answer(text: str) -> str | None:
-    """Extract the final ANSWER: block."""
-    for i, line in enumerate(text.split("\n")):
-        if line.strip().upper().startswith("ANSWER:"):
-            return "\n".join(text.split("\n")[i:]).split(":", 1)[1].strip()
-    return None
+_CONTEXT_PRONOUNS = {
+    "those", "that", "it", "they", "them", "these", "this",
+    "what about", "and the", "how about", "same", "above", "mentioned"
+}
 
 
-def run_agent(session_id: str, user_query: str) -> Dict[str, Any]:
+def rewrite_query(user_query: str, history: List[Dict[str, str]]) -> str:
     """
-    ReAct-style agent loop:
-    - Thinks about what to search
-    - Retrieves from ChromaDB
-    - Injects results and continues reasoning
-    - Returns final answer + sources used
+    Rewrite a potentially contextual/follow-up query into a fully
+    self-contained search query using conversation history.
+    Only calls the LLM when the query actually contains context-dependent words.
     """
+    if not history:
+        return user_query  # no history, nothing to resolve
+
+    # Fast path: query is self-contained — skip LLM call entirely
+    words = user_query.lower()
+    needs_rewrite = any(p in words for p in _CONTEXT_PRONOUNS)
+    if not needs_rewrite:
+        return user_query
+
+    # Build a compact summary of prior turns
+    history_text = "\n".join([
+        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:200]}"
+        for m in history[-(MAX_HISTORY_TURNS * 2):]
+    ])
+
     messages = [
-        {"role": "system", "content": _build_system_prompt()},
-        {"role": "user", "content": user_query},
+        {
+            "role": "system",
+            "content": (
+                "You rewrite follow-up questions into standalone search queries. "
+                "Output ONLY the rewritten query — no explanation, no quotes, no punctuation at the end. "
+                "If the question is already self-contained, return it unchanged."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Conversation so far:\n{history_text}\n\n"
+                f"Follow-up question: {user_query}\n\n"
+                "Rewrite this as a standalone search query that could be understood without the conversation context."
+            ),
+        },
     ]
 
-    all_sources: List[Dict] = []
-    reasoning_trace: List[str] = []
+    rewritten = _call_ollama(messages).strip().strip('"').strip("'")
+    # Sanity check: if it ballooned or looks wrong, fall back
+    if len(rewritten) > 200 or not rewritten:
+        return user_query
+    return rewritten
 
-    for hop in range(MAX_HOPS):
-        response = _call_ollama(messages)
-        reasoning_trace.append(response)
 
-        search_query = _parse_search_query(response)
+def _refine_query(user_query: str, first_chunks: List[Dict]) -> Optional[str]:
+    """
+    Lightweight heuristic second-search decision — no extra LLM call.
+    Only do a second retrieval if the first pass returned fewer than 4 chunks
+    OR the query contains comparison/contrast keywords that suggest multi-angle retrieval.
+    """
+    if not first_chunks or len(first_chunks) >= 6:
+        return None  # plenty of results, skip second hop
 
-        if search_query:
-            retrieved = query_collection(session_id, search_query, n_results=6)
-            all_sources.extend(retrieved)
+    COMPARE_KEYWORDS = {"compare", "versus", "vs", "difference", "contrast",
+                        "better", "worse", "gap", "missing", "lacks"}
+    words = set(user_query.lower().split())
+    if words & COMPARE_KEYWORDS:
+        # Build a complementary query focusing on the other document
+        sources = {c["metadata"].get("source", "") for c in first_chunks}
+        if any("resume" in s.lower() or "cv" in s.lower() for s in sources):
+            return f"job requirements {user_query}"
+        return f"candidate skills {user_query}"
 
-            context_block = "\n\n".join([
-                f"[{i+1}] Source: {c['metadata'].get('source','?')}, "
-                f"Page: {c['metadata'].get('page','?')}, "
-                f"Modality: {c['metadata'].get('modality','text')}\n{c['text']}"
-                for i, c in enumerate(retrieved)
-            ])
+    return None
 
-            tool_result = (
-                f"SEARCH RESULTS for '{search_query}':\n\n{context_block}"
-                if retrieved
-                else f"SEARCH RESULTS for '{search_query}': No relevant content found."
-            )
 
-            messages.append({"role": "assistant", "content": response})
-            messages.append({"role": "user", "content": tool_result})
+def _history_to_messages(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    Convert stored history to Ollama message format.
+    - Keep last MAX_HISTORY_TURNS pairs
+    - Truncate assistant messages to 300 chars so they don't overwhelm context
+    """
+    trimmed = []
+    for m in history[-(MAX_HISTORY_TURNS * 2):]:
+        if m["role"] == "assistant":
+            # Keep first sentence + truncated remainder so model knows what was said
+            # but can't just copy-paste it
+            content = m["content"][:300].rsplit(" ", 1)[0] + "…" if len(m["content"]) > 300 else m["content"]
+            trimmed.append({"role": "assistant", "content": content})
+        else:
+            trimmed.append({"role": "user", "content": m["content"]})
+    return trimmed
 
-        final_answer = _parse_final_answer(response)
-        if final_answer:
-            # Deduplicate sources by (source, page)
-            seen = set()
-            unique_sources = []
-            for s in all_sources:
-                key = (s["metadata"].get("source"), s["metadata"].get("page"))
-                if key not in seen:
-                    seen.add(key)
-                    unique_sources.append(s)
 
-            return {
-                "answer": final_answer,
-                "sources": unique_sources,
-                "hops": hop + 1,
-                "reasoning_trace": reasoning_trace,
-            }
+def run_agent(
+    session_id: str,
+    user_query: str,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    """
+    Conversational retrieve-then-read RAG:
+    1. Rewrite contextual queries using history (for accurate retrieval)
+    2. Search ChromaDB with the rewritten query
+    3. Optionally do a second search with a refined angle
+    4. Answer using retrieved context + conversation history
+    """
+    history = history or []
 
-    # Fallback: return last response as-is
+    # --- Query rewriting for retrieval ---
+    retrieval_query = rewrite_query(user_query, history)
+
+    # --- First retrieval ---
+    first_chunks = query_collection(session_id, retrieval_query, n_results=10)
+
+    # --- Optional second retrieval ---
+    refined_query = _refine_query(retrieval_query, first_chunks)
+    second_chunks: List[Dict] = []
+    hops = 1
+    if refined_query:
+        second_chunks = query_collection(session_id, refined_query, n_results=6)
+        hops = 2
+
+    # Merge and deduplicate by text hash (not page — single-page docs
+    # like a resume produce multiple chunks all tagged as "page 1")
+    import hashlib
+    all_chunks = first_chunks + second_chunks
+    seen: set = set()
+    unique_chunks: List[Dict] = []
+    for c in all_chunks:
+        key = hashlib.md5(c["text"].encode()).hexdigest()
+        if key not in seen:
+            seen.add(key)
+            unique_chunks.append(c)
+
+    if not unique_chunks:
+        return {
+            "answer": "I couldn't find relevant information in the uploaded documents.",
+            "sources": [],
+            "hops": hops,
+        }
+
+    context = _build_context(unique_chunks)
+
+    # --- Build messages: system + history + grounded question ---
+    system_msg = (
+        "You are a precise document analyst with memory of the conversation. "
+        "Each excerpt is labeled with its document type (JOB DESCRIPTION, CANDIDATE RESUME, or DOCUMENT). "
+        "CRITICAL RULES:\n"
+        "1. Never confuse what a JOB DESCRIPTION requires with what a CANDIDATE RESUME demonstrates.\n"
+        "2. Only attribute a skill to the candidate if a CANDIDATE RESUME excerpt explicitly states it.\n"
+        "3. Only attribute a requirement to the job if a JOB DESCRIPTION excerpt explicitly states it.\n"
+        "4. Cite every claim with its excerpt number [1], [2], etc.\n"
+        "5. If an excerpt does not contain the answer, say so — do not infer or hallucinate.\n"
+        "6. Use conversation history only to understand what 'those', 'that', 'it' refers to — not as a source of facts.\n"
+        "7. When asked to compare, explicitly list matches and gaps side-by-side using what JOB DESCRIPTION excerpts require vs what CANDIDATE RESUME excerpts show."
+    )
+
+    history_messages = _history_to_messages(history)
+
+    # Inject the document context as the final user turn
+    grounded_question = (
+        f"DOCUMENT EXCERPTS:\n\n{context}\n\n"
+        f"---\n\n"
+        f"Question: {user_query}\n\n"
+        "Answer using only the excerpts above. Cite with [1], [2], etc."
+    )
+
+    messages = (
+        [{"role": "system", "content": system_msg}]
+        + history_messages
+        + [{"role": "user", "content": grounded_question}]
+    )
+
+    answer = _call_ollama(messages)
+
     return {
-        "answer": reasoning_trace[-1] if reasoning_trace else "I could not find an answer.",
-        "sources": all_sources,
-        "hops": MAX_HOPS,
-        "reasoning_trace": reasoning_trace,
+        "answer": answer,
+        "sources": unique_chunks,
+        "hops": hops,
     }
