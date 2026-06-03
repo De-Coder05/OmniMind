@@ -20,33 +20,26 @@ def _get_model():
 
 
 def process_audio(file_path: str) -> List[Dict[str, Any]]:
-    """Transcribe audio/video file using Whisper, return as text chunks."""
     path = Path(file_path)
     if path.suffix.lower() not in SUPPORTED:
         return []
 
-    model = _get_model()
-    result = model.transcribe(file_path)
+    result = _get_model().transcribe(file_path)
     full_text = result.get("text", "").strip()
-
     if not full_text:
         return []
 
     chunks = []
     words = full_text.split()
-    chunk_size = 400
-    overlap = 40
-
     i = 0
     while i < len(words):
-        chunk = " ".join(words[i: i + chunk_size])
         chunks.append({
-            "text": chunk,
+            "text": " ".join(words[i:i + 400]),
             "modality": "audio",
             "source": path.name,
             "page": 1,
             "type": "audio_transcript",
         })
-        i += chunk_size - overlap
+        i += 360
 
     return chunks

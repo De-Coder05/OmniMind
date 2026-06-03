@@ -6,17 +6,14 @@ SUPPORTED = {".csv", ".tsv", ".xlsx", ".xls"}
 
 
 def process_table(file_path: str) -> List[Dict[str, Any]]:
-    """Convert tabular files into natural-language text chunks."""
     path = Path(file_path)
-    suffix = path.suffix.lower()
-
-    if suffix not in SUPPORTED:
+    if path.suffix.lower() not in SUPPORTED:
         return []
 
     try:
-        if suffix == ".csv":
+        if path.suffix.lower() == ".csv":
             df = pd.read_csv(file_path)
-        elif suffix == ".tsv":
+        elif path.suffix.lower() == ".tsv":
             df = pd.read_csv(file_path, sep="\t")
         else:
             df = pd.read_excel(file_path)
@@ -24,14 +21,10 @@ def process_table(file_path: str) -> List[Dict[str, Any]]:
         return []
 
     chunks = []
-    # Convert each row group (50 rows) into a natural-language chunk
-    row_chunk_size = 50
-    for start in range(0, len(df), row_chunk_size):
-        subset = df.iloc[start: start + row_chunk_size]
-        text = f"Table from {path.name} (rows {start + 1}–{start + len(subset)}):\n"
-        text += subset.to_string(index=False)
+    for start in range(0, len(df), 50):
+        subset = df.iloc[start:start + 50]
         chunks.append({
-            "text": text,
+            "text": f"Table from {path.name} (rows {start + 1}–{start + len(subset)}):\n{subset.to_string(index=False)}",
             "modality": "table",
             "source": path.name,
             "page": 1,

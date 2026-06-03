@@ -13,9 +13,7 @@ TABLE_EXT = {".csv", ".tsv", ".xlsx", ".xls"}
 
 
 def ingest_file(file_path: str) -> List[Dict[str, Any]]:
-    """Route a file to the appropriate processor and return chunks."""
     suffix = Path(file_path).suffix.lower()
-
     if suffix in PDF_EXT:
         return process_pdf(file_path)
     elif suffix in IMAGE_EXT:
@@ -24,5 +22,4 @@ def ingest_file(file_path: str) -> List[Dict[str, Any]]:
         return process_audio(file_path)
     elif suffix in TABLE_EXT:
         return process_table(file_path)
-    else:
-        return []
+    return []

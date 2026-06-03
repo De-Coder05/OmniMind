@@ -3,22 +3,17 @@ import axios from "axios";
 const BASE = "/api";
 
 export const createSession = () =>
-  axios.post(`${BASE}/session/create`).then((r) => r.data.session_id);
+  axios.post(`${BASE}/session/create`).then(r => r.data.session_id);
 
 export const uploadFiles = (sessionId, files) => {
   const form = new FormData();
-  files.forEach((f) => form.append("files", f));
-  return axios.post(`${BASE}/session/${sessionId}/upload`, form).then((r) => r.data);
+  files.forEach(f => form.append("files", f));
+  return axios.post(`${BASE}/session/${sessionId}/upload`, form).then(r => r.data);
 };
 
 export const deleteSession = (sessionId) =>
   axios.delete(`${BASE}/session/${sessionId}`);
 
-/**
- * Streaming query via SSE.
- * Calls onToken(str) for each text token.
- * Calls onDone({ sources, hops }) when complete.
- */
 export async function queryStream(sessionId, query, onToken, onDone) {
   const resp = await fetch(`${BASE}/query/stream`, {
     method: "POST",
@@ -38,7 +33,7 @@ export async function queryStream(sessionId, query, onToken, onDone) {
 
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split("\n");
-    buffer = lines.pop(); // keep incomplete line
+    buffer = lines.pop();
 
     for (const line of lines) {
       if (!line.startsWith("data: ")) continue;
@@ -49,7 +44,6 @@ export async function queryStream(sessionId, query, onToken, onDone) {
         if (parsed.token !== undefined) onToken(parsed.token);
         else if (parsed.sources !== undefined) onDone(parsed);
       } catch {
-        // plain text token fallback
         onToken(raw);
       }
     }
