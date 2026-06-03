@@ -2,7 +2,7 @@
 
 > Ask anything about your documents. Get grounded, cited answers — across PDFs, images, audio, and tables — powered entirely by local inference.
 
-![OmniMind UI](docs/screenshot.png)
+![OmniMind UI](docs/screenshot.jpeg)
 
 ---
 
